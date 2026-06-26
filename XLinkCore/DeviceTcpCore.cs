@@ -5,12 +5,14 @@ namespace XLinkCore;
 
 public abstract class DeviceTcpCore : IDeviceCoreNet
 {
+    public abstract bool IsConnected { get; }
+
     public virtual int ReceiveTimeOut { get; set; }
     public virtual int ConnectTimeOut { get; set; }
-    public virtual string IpAddress { get; set; }
+    public virtual string IpAddress { get; set; } = string.Empty;
     public virtual int Port { get; set; }
 
-    protected virtual Socket Socket { get; }
+    protected virtual Socket? Socket { get; }
 
     public abstract Result Connect();
 
@@ -21,8 +23,6 @@ public abstract class DeviceTcpCore : IDeviceCoreNet
     public abstract Result<T[]> ReadArray<T>(string point, ushort length) where T : struct;
 
     public abstract Result<string> ReadString(string point, ushort length);
-
-    public abstract Result<string[]> ReadStringArray(string point, ushort length);
 
     public abstract Result Write<T>(string point, T value);
 
@@ -35,8 +35,6 @@ public abstract class DeviceTcpCore : IDeviceCoreNet
     public abstract Task<Result<T[]>> ReadArrayAsync<T>(string point, ushort length) where T : struct;
 
     public abstract Task<Result<string>> ReadStringAsync(string point, ushort length);
-
-    public abstract Task<Result<string[]>> ReadStringArrayAsync(string point, ushort length);
 
     public abstract Task<Result> WriteAsync<T>(string point, T value);
 

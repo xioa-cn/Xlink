@@ -1,4 +1,6 @@
 using System;
+using System.Buffers;
+using System.Diagnostics;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
@@ -8,42 +10,264 @@ namespace XLinkCore.ModbusTcp
     public class ModbusTcpNet : ICommunicationCore, ICommunicationCoreAsync
     {
         private readonly SemaphoreSlim _communicationLock = new SemaphoreSlim(1, 1);
+        private readonly object _stateLock = new object();
+        private readonly object _statisticsLock = new object();
+        private const int DefaultLockWaitTimeOut = 5000;
+        private const uint KeepAliveTime = 60000;
+        private const uint KeepAliveInterval = 5000;
         private ushort _transactionId;
+        private string _ipAddress;
+        private int _port;
+        private int _receiveTimeOut;
+        private int _connectTimeOut;
+        private int _lockWaitTimeOut = DefaultLockWaitTimeOut;
+        private long _bytesSent;
+        private long _bytesReceived;
+        private long _requestCount;
+        private long _failedRequestCount;
+        private long _totalElapsedTicks;
+        private long _lastElapsedTicks;
+        private long _maxElapsedTicks;
+        private bool _disposed;
+        private ModbusWriteResponse _lastWriteResponse;
 
-        public string IpAddress { get; set; }
-        public int Port { get; set; }
-        public int ReceiveTimeOut { get; set; }
-        public int ConnectTimeOut { get; set; }
+        public string IpAddress
+        {
+            get
+            {
+                lock (_stateLock)
+                {
+                    return _ipAddress;
+                }
+            }
+            set
+            {
+                lock (_stateLock)
+                {
+                    ThrowIfConnectedLocked("IpAddress");
+                    _ipAddress = value;
+                }
+            }
+        }
+
+        public int Port
+        {
+            get
+            {
+                lock (_stateLock)
+                {
+                    return _port;
+                }
+            }
+            set
+            {
+                lock (_stateLock)
+                {
+                    ThrowIfConnectedLocked("Port");
+                    _port = value;
+                }
+            }
+        }
+
+        public int ReceiveTimeOut
+        {
+            get
+            {
+                lock (_stateLock)
+                {
+                    return _receiveTimeOut;
+                }
+            }
+            set
+            {
+                lock (_stateLock)
+                {
+                    ValidateTimeoutConfiguration(value, _lockWaitTimeOut);
+                    _receiveTimeOut = value;
+                    if (Socket != null)
+                    {
+                        Socket.ReceiveTimeout = value;
+                        Socket.SendTimeout = value;
+                    }
+                }
+            }
+        }
+
+        public int ConnectTimeOut
+        {
+            get
+            {
+                lock (_stateLock)
+                {
+                    return _connectTimeOut;
+                }
+            }
+            set
+            {
+                lock (_stateLock)
+                {
+                    _connectTimeOut = value;
+                }
+            }
+        }
+
+        public int LockWaitTimeOut
+        {
+            get
+            {
+                lock (_stateLock)
+                {
+                    return _lockWaitTimeOut;
+                }
+            }
+            set
+            {
+                lock (_stateLock)
+                {
+                    ValidateTimeoutConfiguration(_receiveTimeOut, value);
+                    _lockWaitTimeOut = value;
+                }
+            }
+        }
+
+        public bool IsConnected
+        {
+            get
+            {
+                lock (_stateLock)
+                {
+                    return Socket != null && Socket.Connected;
+                }
+            }
+        }
+
+        public bool IsBusy
+        {
+            get { return _communicationLock.CurrentCount == 0; }
+        }
+
+        public ModbusWriteResponse LastWriteResponse
+        {
+            get
+            {
+                lock (_stateLock)
+                {
+                    return _lastWriteResponse;
+                }
+            }
+        }
+
         public Socket Socket { get; private set; }
+
+        public ModbusTcpStatistics GetStatistics()
+        {
+            lock (_statisticsLock)
+            {
+                return new ModbusTcpStatistics(
+                    _bytesSent,
+                    _bytesReceived,
+                    _requestCount,
+                    _failedRequestCount,
+                    TimeSpan.FromTicks(_totalElapsedTicks),
+                    TimeSpan.FromTicks(_lastElapsedTicks),
+                    TimeSpan.FromTicks(_maxElapsedTicks));
+            }
+        }
+
+        public void ResetStatistics()
+        {
+            lock (_statisticsLock)
+            {
+                _bytesSent = 0;
+                _bytesReceived = 0;
+                _requestCount = 0;
+                _failedRequestCount = 0;
+                _totalElapsedTicks = 0;
+                _lastElapsedTicks = 0;
+                _maxElapsedTicks = 0;
+            }
+        }
 
         public void Dispose()
         {
-            Disconnect();
-            _communicationLock.Dispose();
+            bool shouldDispose;
+            lock (_stateLock)
+            {
+                shouldDispose = !_disposed;
+                _disposed = true;
+            }
+
+            if (!shouldDispose)
+            {
+                return;
+            }
+
+            bool entered = false;
+            try
+            {
+                entered = TryEnterCommunicationLock(true);
+                DisconnectCore();
+            }
+            catch
+            {
+            }
+            finally
+            {
+                if (entered)
+                {
+                    _communicationLock.Release();
+                }
+
+                _communicationLock.Dispose();
+            }
         }
 
         public Result Connect()
         {
-            _communicationLock.Wait();
+            if (!TryEnterCommunicationLock())
+            {
+                return Error("Communication lock wait timeout.", ModbusTcpErrorCodes.CommunicationLockTimeout);
+            }
+
             try
             {
+                ThrowIfDisposed();
                 DisconnectCore();
 
-                Socket = CreateSocket();
-                if (ConnectTimeOut > 0)
+                string ipAddress;
+                int port;
+                int connectTimeOut;
+                lock (_stateLock)
                 {
-                    IAsyncResult result = Socket.BeginConnect(IpAddress, Port, null, null);
-                    if (!result.AsyncWaitHandle.WaitOne(ConnectTimeOut))
-                    {
-                        DisconnectCore();
-                        return Error("Connect timeout.", -1);
-                    }
+                    ipAddress = _ipAddress;
+                    port = _port;
+                    connectTimeOut = _connectTimeOut;
+                }
 
-                    Socket.EndConnect(result);
+                Socket = CreateSocket();
+                if (connectTimeOut > 0)
+                {
+                    IAsyncResult result = Socket.BeginConnect(ipAddress, port, null, null);
+                    try
+                    {
+                        if (!result.AsyncWaitHandle.WaitOne(connectTimeOut))
+                        {
+                            Socket timedOutSocket = Socket;
+                            DisconnectCore();
+                            CompleteTimedOutConnect(timedOutSocket, result);
+                            return Error("Connect timeout.", ModbusTcpErrorCodes.Timeout);
+                        }
+
+                        Socket.EndConnect(result);
+                    }
+                    finally
+                    {
+                        result.AsyncWaitHandle.Dispose();
+                    }
                 }
                 else
                 {
-                    Socket.Connect(IpAddress, Port);
+                    Socket.Connect(ipAddress, port);
                 }
 
                 return Success();
@@ -51,7 +275,7 @@ namespace XLinkCore.ModbusTcp
             catch (Exception ex)
             {
                 DisconnectCore();
-                return Error(ex.Message, -1);
+                return Error(ex);
             }
             finally
             {
@@ -61,7 +285,11 @@ namespace XLinkCore.ModbusTcp
 
         public Result Disconnect()
         {
-            _communicationLock.Wait();
+            if (!TryEnterCommunicationLock())
+            {
+                return Error("Communication lock wait timeout.", ModbusTcpErrorCodes.CommunicationLockTimeout);
+            }
+
             try
             {
                 DisconnectCore();
@@ -70,7 +298,7 @@ namespace XLinkCore.ModbusTcp
             catch (Exception ex)
             {
                 Socket = null;
-                return Error(ex.Message, -1);
+                return Error(ex);
             }
             finally
             {
@@ -80,25 +308,40 @@ namespace XLinkCore.ModbusTcp
 
         public async Task<Result> ConnectAsync()
         {
-            await _communicationLock.WaitAsync().ConfigureAwait(false);
+            if (!await TryEnterCommunicationLockAsync().ConfigureAwait(false))
+            {
+                return Error("Communication lock wait timeout.", ModbusTcpErrorCodes.CommunicationLockTimeout);
+            }
+
             try
             {
+                ThrowIfDisposed();
                 DisconnectCore();
+
+                string ipAddress;
+                int port;
+                int connectTimeOut;
+                lock (_stateLock)
+                {
+                    ipAddress = _ipAddress;
+                    port = _port;
+                    connectTimeOut = _connectTimeOut;
+                }
 
                 Socket = CreateSocket();
                 Task connectTask = Task.Factory.FromAsync(
-                    (callback, state) => Socket.BeginConnect(IpAddress, Port, callback, state),
+                    (callback, state) => Socket.BeginConnect(ipAddress, port, callback, state),
                     Socket.EndConnect,
                     null);
 
-                if (ConnectTimeOut > 0)
+                if (connectTimeOut > 0)
                 {
-                    Task timeoutTask = Task.Delay(ConnectTimeOut);
+                    Task timeoutTask = Task.Delay(connectTimeOut);
                     Task completedTask = await Task.WhenAny(connectTask, timeoutTask).ConfigureAwait(false);
                     if (completedTask != connectTask)
                     {
                         DisconnectCore();
-                        return Error("Connect timeout.", -1);
+                        return Error("Connect timeout.", ModbusTcpErrorCodes.Timeout);
                     }
                 }
 
@@ -108,7 +351,7 @@ namespace XLinkCore.ModbusTcp
             catch (Exception ex)
             {
                 DisconnectCore();
-                return Error(ex.Message, -1);
+                return Error(ex);
             }
             finally
             {
@@ -118,7 +361,11 @@ namespace XLinkCore.ModbusTcp
 
         public async Task<Result> DisconnectAsync()
         {
-            await _communicationLock.WaitAsync().ConfigureAwait(false);
+            if (!await TryEnterCommunicationLockAsync().ConfigureAwait(false))
+            {
+                return Error("Communication lock wait timeout.", ModbusTcpErrorCodes.CommunicationLockTimeout);
+            }
+
             try
             {
                 DisconnectCore();
@@ -127,7 +374,7 @@ namespace XLinkCore.ModbusTcp
             catch (Exception ex)
             {
                 Socket = null;
-                return Error(ex.Message, -1);
+                return Error(ex);
             }
             finally
             {
@@ -175,7 +422,7 @@ namespace XLinkCore.ModbusTcp
             return ReadRegistersAsync(station, 4, address, quantity);
         }
 
-        public void WriteSingleCoil(byte station, ushort address, bool value)
+        public ModbusWriteResponse WriteSingleCoil(byte station, ushort address, bool value)
         {
             byte[] pdu = new byte[]
             {
@@ -186,10 +433,11 @@ namespace XLinkCore.ModbusTcp
                 0x00
             };
 
-            Execute(station, pdu);
+            byte[] response = Execute(station, pdu);
+            return SetLastWriteResponse(ParseWriteSingleResponse(pdu, response));
         }
 
-        public Task WriteSingleCoilAsync(byte station, ushort address, bool value)
+        public Task<ModbusWriteResponse> WriteSingleCoilAsync(byte station, ushort address, bool value)
         {
             byte[] pdu = new byte[]
             {
@@ -200,20 +448,22 @@ namespace XLinkCore.ModbusTcp
                 0x00
             };
 
-            return ExecuteAsync(station, pdu);
+            return WriteSingleAsync(station, pdu);
         }
 
-        public void WriteMultipleCoils(byte station, ushort address, bool[] values)
+        public ModbusWriteResponse WriteMultipleCoils(byte station, ushort address, bool[] values)
         {
-            Execute(station, CreateWriteMultipleCoilsPdu(address, values));
+            byte[] pdu = CreateWriteMultipleCoilsPdu(address, values);
+            byte[] response = Execute(station, pdu);
+            return SetLastWriteResponse(ParseWriteMultipleResponse(pdu, response));
         }
 
-        public Task WriteMultipleCoilsAsync(byte station, ushort address, bool[] values)
+        public Task<ModbusWriteResponse> WriteMultipleCoilsAsync(byte station, ushort address, bool[] values)
         {
-            return ExecuteAsync(station, CreateWriteMultipleCoilsPdu(address, values));
+            return WriteMultipleAsync(station, CreateWriteMultipleCoilsPdu(address, values));
         }
 
-        public void WriteSingleRegister(byte station, ushort address, byte[] registerBytes)
+        public ModbusWriteResponse WriteSingleRegister(byte station, ushort address, byte[] registerBytes)
         {
             if (registerBytes == null || registerBytes.Length != 2)
             {
@@ -229,10 +479,11 @@ namespace XLinkCore.ModbusTcp
                 registerBytes[1]
             };
 
-            Execute(station, pdu);
+            byte[] response = Execute(station, pdu);
+            return SetLastWriteResponse(ParseWriteSingleResponse(pdu, response));
         }
 
-        public Task WriteSingleRegisterAsync(byte station, ushort address, byte[] registerBytes)
+        public Task<ModbusWriteResponse> WriteSingleRegisterAsync(byte station, ushort address, byte[] registerBytes)
         {
             if (registerBytes == null || registerBytes.Length != 2)
             {
@@ -248,58 +499,85 @@ namespace XLinkCore.ModbusTcp
                 registerBytes[1]
             };
 
-            return ExecuteAsync(station, pdu);
+            return WriteSingleAsync(station, pdu);
         }
 
-        public void WriteMultipleRegisters(byte station, ushort address, byte[] registerBytes)
+        public ModbusWriteResponse WriteMultipleRegisters(byte station, ushort address, byte[] registerBytes)
         {
-            Execute(station, CreateWriteMultipleRegistersPdu(address, registerBytes));
+            byte[] pdu = CreateWriteMultipleRegistersPdu(address, registerBytes);
+            byte[] response = Execute(station, pdu);
+            return SetLastWriteResponse(ParseWriteMultipleResponse(pdu, response));
         }
 
-        public Task WriteMultipleRegistersAsync(byte station, ushort address, byte[] registerBytes)
+        public Task<ModbusWriteResponse> WriteMultipleRegistersAsync(byte station, ushort address, byte[] registerBytes)
         {
-            return ExecuteAsync(station, CreateWriteMultipleRegistersPdu(address, registerBytes));
+            return WriteMultipleAsync(station, CreateWriteMultipleRegistersPdu(address, registerBytes));
+        }
+
+        internal byte[] OriginalBytes(byte[] request)
+        {
+            if (request == null)
+            {
+                throw new ArgumentNullException("request");
+            }
+
+            if (request.Length < 8)
+            {
+                throw new ArgumentException("Modbus TCP request must contain MBAP header and PDU.", "request");
+            }
+
+            int requestLength = ToUInt16(request[4], request[5]);
+            if (requestLength <= 1 || request.Length != requestLength + 6)
+            {
+                throw new ArgumentException("Invalid Modbus TCP request length.", "request");
+            }
+
+            if (!TryEnterCommunicationLock())
+            {
+                throw new ModbusTcpException("Communication lock wait timeout.", ModbusTcpErrorCodes.CommunicationLockTimeout);
+            }
+
+            try
+            {
+                return ReadOriginalBytesCore(request);
+            }
+            finally
+            {
+                _communicationLock.Release();
+            }
         }
 
         private byte[] ReadBits(byte station, byte functionCode, ushort address, ushort quantity)
         {
             byte[] response = Execute(station, CreateReadPdu(functionCode, address, quantity));
-            byte byteCount = response[1];
-            byte[] data = new byte[byteCount];
-            Buffer.BlockCopy(response, 2, data, 0, byteCount);
-            return data;
+            return ExtractReadData(response);
         }
 
         private async Task<byte[]> ReadBitsAsync(byte station, byte functionCode, ushort address, ushort quantity)
         {
             byte[] response = await ExecuteAsync(station, CreateReadPdu(functionCode, address, quantity)).ConfigureAwait(false);
-            byte byteCount = response[1];
-            byte[] data = new byte[byteCount];
-            Buffer.BlockCopy(response, 2, data, 0, byteCount);
-            return data;
+            return ExtractReadData(response);
         }
 
         private byte[] ReadRegisters(byte station, byte functionCode, ushort address, ushort quantity)
         {
             byte[] response = Execute(station, CreateReadPdu(functionCode, address, quantity));
-            byte byteCount = response[1];
-            byte[] data = new byte[byteCount];
-            Buffer.BlockCopy(response, 2, data, 0, byteCount);
-            return data;
+            return ExtractReadData(response);
         }
 
         private async Task<byte[]> ReadRegistersAsync(byte station, byte functionCode, ushort address, ushort quantity)
         {
             byte[] response = await ExecuteAsync(station, CreateReadPdu(functionCode, address, quantity)).ConfigureAwait(false);
-            byte byteCount = response[1];
-            byte[] data = new byte[byteCount];
-            Buffer.BlockCopy(response, 2, data, 0, byteCount);
-            return data;
+            return ExtractReadData(response);
         }
 
         private byte[] Execute(byte station, byte[] pdu)
         {
-            _communicationLock.Wait();
+            if (!TryEnterCommunicationLock())
+            {
+                throw new ModbusTcpException("Communication lock wait timeout.", ModbusTcpErrorCodes.CommunicationLockTimeout);
+            }
+
             try
             {
                 return ExecuteCore(station, pdu);
@@ -312,7 +590,11 @@ namespace XLinkCore.ModbusTcp
 
         private async Task<byte[]> ExecuteAsync(byte station, byte[] pdu)
         {
-            await _communicationLock.WaitAsync().ConfigureAwait(false);
+            if (!await TryEnterCommunicationLockAsync().ConfigureAwait(false))
+            {
+                throw new ModbusTcpException("Communication lock wait timeout.", ModbusTcpErrorCodes.CommunicationLockTimeout);
+            }
+
             try
             {
                 return await ExecuteCoreAsync(station, pdu).ConfigureAwait(false);
@@ -323,43 +605,156 @@ namespace XLinkCore.ModbusTcp
             }
         }
 
+        private async Task<ModbusWriteResponse> WriteSingleAsync(byte station, byte[] pdu)
+        {
+            byte[] response = await ExecuteAsync(station, pdu).ConfigureAwait(false);
+            return SetLastWriteResponse(ParseWriteSingleResponse(pdu, response));
+        }
+
+        private async Task<ModbusWriteResponse> WriteMultipleAsync(byte station, byte[] pdu)
+        {
+            byte[] response = await ExecuteAsync(station, pdu).ConfigureAwait(false);
+            return SetLastWriteResponse(ParseWriteMultipleResponse(pdu, response));
+        }
+
+        private static byte[] ExtractReadData(byte[] response)
+        {
+            byte byteCount = response[1];
+            return CopyExact(response, 2, byteCount);
+        }
+
         private byte[] ExecuteCore(byte station, byte[] pdu)
         {
-            if (Socket == null || !Socket.Connected)
+            Stopwatch stopwatch = Stopwatch.StartNew();
+            bool success = false;
+            try
             {
-                throw new InvalidOperationException("Socket is not connected.");
+                EnsureConnected();
+
+                ushort transactionId = unchecked(++_transactionId);
+                byte[] request = CreateRequest(station, transactionId, pdu);
+
+                SendAll(request);
+                byte[] header = RentAndReceiveExact(7);
+                try
+                {
+                    int bodyLength = ValidateHeader(station, transactionId, header) - 1;
+                    byte[] rentedBody = RentAndReceiveExact(bodyLength);
+                    try
+                    {
+                        ValidateBody(pdu, rentedBody, bodyLength);
+                        byte[] body = CopyExact(rentedBody, 0, bodyLength);
+                        success = true;
+                        return body;
+                    }
+                    finally
+                    {
+                        ReturnArray(rentedBody);
+                    }
+                }
+                finally
+                {
+                    ReturnArray(header);
+                }
             }
+            catch (SocketException ex)
+            {
+                throw ConvertSocketException(ex);
+            }
+            finally
+            {
+                RecordRequest(stopwatch.ElapsedTicks, success);
+            }
+        }
 
-            ushort transactionId = unchecked(++_transactionId);
-            byte[] request = CreateRequest(station, transactionId, pdu);
+        private byte[] ReadOriginalBytesCore(byte[] request)
+        {
+            Stopwatch stopwatch = Stopwatch.StartNew();
+            bool success = false;
+            try
+            {
+                EnsureConnected();
 
-            SendAll(request);
-            byte[] header = ReceiveExact(7);
-            byte[] body = ReceiveExact(ValidateHeader(station, transactionId, header) - 1);
-            ValidateBody(pdu, body);
-            return body;
+                SendAll(request);
+
+                byte[] response = new byte[7];
+                ReceiveExact(response, 0, 7);
+                ValidateOriginalHeader(request, response);
+
+                int responseLength = ToUInt16(response[4], response[5]);
+                int responseFrameLength = 6 + responseLength;
+                if (response.Length != responseFrameLength)
+                {
+                    Array.Resize(ref response, responseFrameLength);
+                }
+
+                int bodyLength = responseLength - 1;
+                if (bodyLength > 0)
+                {
+                    ReceiveExact(response, 7, bodyLength);
+                }
+
+                success = true;
+                return response;
+            }
+            catch (SocketException ex)
+            {
+                throw ConvertSocketException(ex);
+            }
+            finally
+            {
+                RecordRequest(stopwatch.ElapsedTicks, success);
+            }
         }
 
         private async Task<byte[]> ExecuteCoreAsync(byte station, byte[] pdu)
         {
-            if (Socket == null || !Socket.Connected)
+            Stopwatch stopwatch = Stopwatch.StartNew();
+            bool success = false;
+            try
             {
-                throw new InvalidOperationException("Socket is not connected.");
+                EnsureConnected();
+
+                ushort transactionId = unchecked(++_transactionId);
+                byte[] request = CreateRequest(station, transactionId, pdu);
+
+                await SendAllAsync(request).ConfigureAwait(false);
+                byte[] header = await RentAndReceiveExactAsync(7).ConfigureAwait(false);
+                try
+                {
+                    int bodyLength = ValidateHeader(station, transactionId, header) - 1;
+                    byte[] rentedBody = await RentAndReceiveExactAsync(bodyLength).ConfigureAwait(false);
+                    try
+                    {
+                        ValidateBody(pdu, rentedBody, bodyLength);
+                        byte[] body = CopyExact(rentedBody, 0, bodyLength);
+                        success = true;
+                        return body;
+                    }
+                    finally
+                    {
+                        ReturnArray(rentedBody);
+                    }
+                }
+                finally
+                {
+                    ReturnArray(header);
+                }
             }
-
-            ushort transactionId = unchecked(++_transactionId);
-            byte[] request = CreateRequest(station, transactionId, pdu);
-
-            await SendAllAsync(request).ConfigureAwait(false);
-            byte[] header = await ReceiveExactAsync(7).ConfigureAwait(false);
-            byte[] body = await ReceiveExactAsync(ValidateHeader(station, transactionId, header) - 1).ConfigureAwait(false);
-            ValidateBody(pdu, body);
-            return body;
+            catch (SocketException ex)
+            {
+                throw ConvertSocketException(ex);
+            }
+            finally
+            {
+                RecordRequest(stopwatch.ElapsedTicks, success);
+            }
         }
 
         private Socket CreateSocket()
         {
             Socket socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            EnableKeepAlive(socket);
             if (ReceiveTimeOut > 0)
             {
                 socket.ReceiveTimeout = ReceiveTimeOut;
@@ -367,6 +762,22 @@ namespace XLinkCore.ModbusTcp
             }
 
             return socket;
+        }
+
+        private static void EnableKeepAlive(Socket socket)
+        {
+            socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+
+            if (Environment.OSVersion.Platform != PlatformID.Win32NT)
+            {
+                return;
+            }
+
+            byte[] inOptionValues = new byte[12];
+            BitConverter.GetBytes((uint)1).CopyTo(inOptionValues, 0);
+            BitConverter.GetBytes(KeepAliveTime).CopyTo(inOptionValues, 4);
+            BitConverter.GetBytes(KeepAliveInterval).CopyTo(inOptionValues, 8);
+            socket.IOControl(IOControlCode.KeepAliveValues, inOptionValues, null);
         }
 
         private void DisconnectCore()
@@ -478,44 +889,120 @@ namespace XLinkCore.ModbusTcp
 
             if (responseTransactionId != transactionId)
             {
-                throw new InvalidOperationException("Modbus transaction id mismatch.");
+                throw new ModbusTcpProtocolException("Modbus transaction id mismatch.");
             }
 
             if (protocolId != 0)
             {
-                throw new InvalidOperationException("Invalid Modbus protocol id.");
+                throw new ModbusTcpProtocolException("Invalid Modbus protocol id.");
             }
 
             if (responseStation != station)
             {
-                throw new InvalidOperationException("Modbus station mismatch.");
+                throw new ModbusTcpProtocolException("Modbus station mismatch.");
             }
 
             if (responseLength <= 1)
             {
-                throw new InvalidOperationException("Invalid Modbus response length.");
+                throw new ModbusTcpProtocolException("Invalid Modbus response length.");
             }
 
             return responseLength;
         }
 
-        private static void ValidateBody(byte[] pdu, byte[] body)
+        private static void ValidateOriginalHeader(byte[] request, byte[] responseHeader)
         {
-            if (body.Length == 0)
+            ushort requestTransactionId = ToUInt16(request[0], request[1]);
+            ushort responseTransactionId = ToUInt16(responseHeader[0], responseHeader[1]);
+            if (responseTransactionId != requestTransactionId)
             {
-                throw new InvalidOperationException("Empty Modbus response.");
+                throw new ModbusTcpProtocolException("Modbus transaction id mismatch.");
+            }
+
+            ushort protocolId = ToUInt16(responseHeader[2], responseHeader[3]);
+            if (protocolId != 0)
+            {
+                throw new ModbusTcpProtocolException("Invalid Modbus protocol id.");
+            }
+
+            if (responseHeader[6] != request[6])
+            {
+                throw new ModbusTcpProtocolException("Modbus station mismatch.");
+            }
+
+            ushort responseLength = ToUInt16(responseHeader[4], responseHeader[5]);
+            if (responseLength <= 1)
+            {
+                throw new ModbusTcpProtocolException("Invalid Modbus response length.");
+            }
+        }
+
+        private static void ValidateBody(byte[] pdu, byte[] body, int bodyLength)
+        {
+            if (bodyLength == 0)
+            {
+                throw new ModbusTcpProtocolException("Empty Modbus response.");
             }
 
             if ((body[0] & 0x80) == 0x80)
             {
-                int code = body.Length > 1 ? body[1] : 0;
-                throw new InvalidOperationException("Modbus exception code: " + code);
+                int code = bodyLength > 1 ? body[1] : 0;
+                throw new ModbusTcpProtocolException("Modbus exception code: " + code, code);
             }
 
             if (body[0] != pdu[0])
             {
-                throw new InvalidOperationException("Modbus function code mismatch.");
+                throw new ModbusTcpProtocolException("Modbus function code mismatch.");
             }
+        }
+
+        private ModbusWriteResponse SetLastWriteResponse(ModbusWriteResponse response)
+        {
+            lock (_stateLock)
+            {
+                _lastWriteResponse = response;
+            }
+
+            return response;
+        }
+
+        private static ModbusWriteResponse ParseWriteSingleResponse(byte[] pdu, byte[] body)
+        {
+            if (body.Length != pdu.Length)
+            {
+                throw new ModbusTcpProtocolException("Invalid Modbus write response length.");
+            }
+
+            for (int i = 0; i < pdu.Length; i++)
+            {
+                if (body[i] != pdu[i])
+                {
+                    throw new ModbusTcpProtocolException("Modbus write response echo mismatch.");
+                }
+            }
+
+            byte[] valueBytes = new byte[2];
+            valueBytes[0] = body[3];
+            valueBytes[1] = body[4];
+            return new ModbusWriteResponse(body[0], ToUInt16(body[1], body[2]), 1, valueBytes);
+        }
+
+        private static ModbusWriteResponse ParseWriteMultipleResponse(byte[] pdu, byte[] body)
+        {
+            if (body.Length != 5)
+            {
+                throw new ModbusTcpProtocolException("Invalid Modbus write response length.");
+            }
+
+            for (int i = 0; i < body.Length; i++)
+            {
+                if (body[i] != pdu[i])
+                {
+                    throw new ModbusTcpProtocolException("Modbus write response echo mismatch.");
+                }
+            }
+
+            return new ModbusWriteResponse(body[0], ToUInt16(body[1], body[2]), ToUInt16(body[3], body[4]), new byte[0]);
         }
 
         private void SendAll(byte[] buffer)
@@ -530,6 +1017,7 @@ namespace XLinkCore.ModbusTcp
                 }
 
                 sent += count;
+                RecordBytesSent(count);
             }
         }
 
@@ -538,10 +1026,11 @@ namespace XLinkCore.ModbusTcp
             int sent = 0;
             while (sent < buffer.Length)
             {
-                int count = await Task<int>.Factory.FromAsync(
+                Task<int> sendTask = Task<int>.Factory.FromAsync(
                     (callback, state) => Socket.BeginSend(buffer, sent, buffer.Length - sent, SocketFlags.None, callback, state),
                     Socket.EndSend,
-                    null).ConfigureAwait(false);
+                    null);
+                int count = await WithReceiveTimeout(sendTask, "Socket send timeout.").ConfigureAwait(false);
 
                 if (count <= 0)
                 {
@@ -549,47 +1038,150 @@ namespace XLinkCore.ModbusTcp
                 }
 
                 sent += count;
+                RecordBytesSent(count);
             }
         }
 
         private byte[] ReceiveExact(int length)
         {
             byte[] buffer = new byte[length];
+            ReceiveExact(buffer, 0, length);
+            return buffer;
+        }
+
+        private byte[] RentAndReceiveExact(int length)
+        {
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(length);
+            try
+            {
+                ReceiveExact(buffer, 0, length);
+                return buffer;
+            }
+            catch
+            {
+                ReturnArray(buffer);
+                throw;
+            }
+        }
+
+        private void ReceiveExact(byte[] buffer, int offset, int length)
+        {
             int received = 0;
             while (received < length)
             {
-                int count = Socket.Receive(buffer, received, length - received, SocketFlags.None);
+                int count = Socket.Receive(buffer, offset + received, length - received, SocketFlags.None);
                 if (count <= 0)
                 {
-                    throw new SocketException();
+                    throw new SocketException((int)SocketError.ConnectionReset);
                 }
 
                 received += count;
+                RecordBytesReceived(count);
             }
-
-            return buffer;
         }
 
         private async Task<byte[]> ReceiveExactAsync(int length)
         {
             byte[] buffer = new byte[length];
+            await ReceiveExactAsync(buffer, 0, length).ConfigureAwait(false);
+            return buffer;
+        }
+
+        private async Task<byte[]> RentAndReceiveExactAsync(int length)
+        {
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(length);
+            try
+            {
+                await ReceiveExactAsync(buffer, 0, length).ConfigureAwait(false);
+                return buffer;
+            }
+            catch
+            {
+                ReturnArray(buffer);
+                throw;
+            }
+        }
+
+        private async Task ReceiveExactAsync(byte[] buffer, int offset, int length)
+        {
             int received = 0;
             while (received < length)
             {
-                int count = await Task<int>.Factory.FromAsync(
-                    (callback, state) => Socket.BeginReceive(buffer, received, length - received, SocketFlags.None, callback, state),
+                Task<int> receiveTask = Task<int>.Factory.FromAsync(
+                    (callback, state) => Socket.BeginReceive(buffer, offset + received, length - received, SocketFlags.None, callback, state),
                     Socket.EndReceive,
-                    null).ConfigureAwait(false);
+                    null);
+                int count = await WithReceiveTimeout(receiveTask, "Socket receive timeout.").ConfigureAwait(false);
 
                 if (count <= 0)
                 {
-                    throw new SocketException();
+                    throw new SocketException((int)SocketError.ConnectionReset);
                 }
 
                 received += count;
+                RecordBytesReceived(count);
+            }
+        }
+
+        private async Task<T> WithReceiveTimeout<T>(Task<T> operation, string timeoutMessage)
+        {
+            int timeout = GetReceiveTimeout();
+            if (timeout <= 0)
+            {
+                return await operation.ConfigureAwait(false);
             }
 
-            return buffer;
+            Task timeoutTask = Task.Delay(timeout);
+            Task completedTask = await Task.WhenAny(operation, timeoutTask).ConfigureAwait(false);
+            if (completedTask == operation)
+            {
+                return await operation.ConfigureAwait(false);
+            }
+
+            DisconnectCore();
+            _ = ObserveFaultAsync(operation);
+            throw new ModbusTcpTimeoutException(timeoutMessage);
+        }
+
+        private static async Task ObserveFaultAsync<T>(Task<T> task)
+        {
+            try
+            {
+                await task.ConfigureAwait(false);
+            }
+            catch
+            {
+            }
+        }
+
+        private int GetReceiveTimeout()
+        {
+            lock (_stateLock)
+            {
+                return _receiveTimeOut;
+            }
+        }
+
+        private static void ValidateTimeoutConfiguration(int receiveTimeOut, int lockWaitTimeOut)
+        {
+            if (receiveTimeOut > 0 && lockWaitTimeOut >= 0 && lockWaitTimeOut <= receiveTimeOut)
+            {
+                throw new ArgumentOutOfRangeException(
+                    "lockWaitTimeOut",
+                    "LockWaitTimeOut must be greater than ReceiveTimeOut.");
+            }
+        }
+
+        private static byte[] CopyExact(byte[] source, int offset, int length)
+        {
+            byte[] target = new byte[length];
+            Buffer.BlockCopy(source, offset, target, 0, length);
+            return target;
+        }
+
+        private static void ReturnArray(byte[] buffer)
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
         }
 
         private static byte HighByte(ushort value)
@@ -605,6 +1197,143 @@ namespace XLinkCore.ModbusTcp
         private static ushort ToUInt16(byte high, byte low)
         {
             return (ushort)((high << 8) | low);
+        }
+
+        private bool TryEnterCommunicationLock(bool allowDisposed = false)
+        {
+            int timeout;
+            lock (_stateLock)
+            {
+                if (!allowDisposed)
+                {
+                    ThrowIfDisposed();
+                }
+
+                timeout = _lockWaitTimeOut;
+            }
+
+            if (timeout < 0)
+            {
+                _communicationLock.Wait();
+                return true;
+            }
+
+            return _communicationLock.Wait(timeout);
+        }
+
+        private Task<bool> TryEnterCommunicationLockAsync(bool allowDisposed = false)
+        {
+            int timeout;
+            lock (_stateLock)
+            {
+                if (!allowDisposed)
+                {
+                    ThrowIfDisposed();
+                }
+
+                timeout = _lockWaitTimeOut;
+            }
+
+            return timeout < 0
+                ? WaitCommunicationLockWithoutTimeoutAsync()
+                : _communicationLock.WaitAsync(timeout);
+        }
+
+        private async Task<bool> WaitCommunicationLockWithoutTimeoutAsync()
+        {
+            await _communicationLock.WaitAsync().ConfigureAwait(false);
+            return true;
+        }
+
+        private void ThrowIfDisposed()
+        {
+            if (_disposed)
+            {
+                throw new ObjectDisposedException(GetType().FullName);
+            }
+        }
+
+        private void ThrowIfConnectedLocked(string propertyName)
+        {
+            if (Socket != null && Socket.Connected)
+            {
+                throw new InvalidOperationException(propertyName + " cannot be changed while connected.");
+            }
+        }
+
+        private void EnsureConnected()
+        {
+            ThrowIfDisposed();
+
+            if (Socket == null || !Socket.Connected)
+            {
+                throw new ModbusTcpException("Socket is not connected.", ModbusTcpErrorCodes.NotConnected);
+            }
+        }
+
+        private ModbusTcpException ConvertSocketException(SocketException exception)
+        {
+            int errorCode = ModbusTcpErrorCodes.FromSocketError(exception.SocketErrorCode);
+            if (errorCode == ModbusTcpErrorCodes.Timeout)
+            {
+                return new ModbusTcpTimeoutException("Socket timeout.", exception);
+            }
+
+            if (errorCode == ModbusTcpErrorCodes.NetworkDisconnected)
+            {
+                return new ModbusTcpDisconnectedException("Socket disconnected.", exception);
+            }
+
+            return new ModbusTcpException(exception.Message, errorCode, exception);
+        }
+
+        private static void CompleteTimedOutConnect(Socket socket, IAsyncResult result)
+        {
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    socket.EndConnect(result);
+                }
+                catch
+                {
+                }
+            });
+        }
+
+        private void RecordBytesSent(int count)
+        {
+            lock (_statisticsLock)
+            {
+                _bytesSent += count;
+            }
+        }
+
+        private void RecordBytesReceived(int count)
+        {
+            lock (_statisticsLock)
+            {
+                _bytesReceived += count;
+            }
+        }
+
+        private void RecordRequest(long elapsedTicks, bool success)
+        {
+            lock (_statisticsLock)
+            {
+                _requestCount++;
+                if (!success)
+                {
+                    _failedRequestCount++;
+                }
+
+                _lastElapsedTicks = elapsedTicks;
+                _totalElapsedTicks += elapsedTicks;
+                if (elapsedTicks > _maxElapsedTicks)
+                {
+                    _maxElapsedTicks = elapsedTicks;
+                }
+            }
         }
 
         private static Result Success()
@@ -624,6 +1353,11 @@ namespace XLinkCore.ModbusTcp
                 Message = message,
                 ErrorCode = errorCode
             };
+        }
+
+        private static Result Error(Exception exception)
+        {
+            return Error(exception.Message, ModbusTcpErrorCodes.FromException(exception));
         }
     }
 }

@@ -1,7 +1,9 @@
 using System;
+using System.Buffers;
 using System.Globalization;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace XLinkCore.ModbusTcp
@@ -9,22 +11,185 @@ namespace XLinkCore.ModbusTcp
     public class ModbusTcp : DeviceTcpCore
     {
         private readonly ModbusTcpNet _modbusTcpNet;
+        private readonly object _configurationLock = new object();
+        private int _disposed;
+        private DataFormat _dataFormat = DataFormat.ABCD;
+        private int _station = 1;
+        private Encoding _stringEncoding = Encoding.ASCII;
+        private bool _addressStartWithZero = true;
+        private bool _referenceAddressStartWithZero = true;
+        private bool _reverseStringBytes;
+        private bool _swapStringBytes;
 
-        public DataFormat DataFormat { get; set; } = DataFormat.ABCD;
-        public int Station { get; set; } = 1;
-        public Encoding StringEncoding { get; set; } = Encoding.ASCII;
-        public bool AddressStartWithZero { get; set; } = true;
-        public bool ReferenceAddressStartWithZero { get; set; } = true;
-        public bool ReverseStringBytes { get; set; }
-        public bool SwapStringBytes { get; set; }
+        public DataFormat DataFormat
+        {
+            get
+            {
+                lock (_configurationLock)
+                {
+                    return _dataFormat;
+                }
+            }
+            set
+            {
+                lock (_configurationLock)
+                {
+                    ThrowIfConnectedForConfiguration("DataFormat");
+                    _dataFormat = value;
+                }
+            }
+        }
+
+        public int Station
+        {
+            get
+            {
+                lock (_configurationLock)
+                {
+                    return _station;
+                }
+            }
+            set
+            {
+                lock (_configurationLock)
+                {
+                    ThrowIfConnectedForConfiguration("Station");
+                    _station = value;
+                }
+            }
+        }
+
+        public Encoding StringEncoding
+        {
+            get
+            {
+                lock (_configurationLock)
+                {
+                    return _stringEncoding;
+                }
+            }
+            set
+            {
+                if (value == null)
+                {
+                    throw new ArgumentNullException("value");
+                }
+
+                lock (_configurationLock)
+                {
+                    ThrowIfConnectedForConfiguration("StringEncoding");
+                    _stringEncoding = value;
+                }
+            }
+        }
+
+        public bool AddressStartWithZero
+        {
+            get
+            {
+                lock (_configurationLock)
+                {
+                    return _addressStartWithZero;
+                }
+            }
+            set
+            {
+                lock (_configurationLock)
+                {
+                    ThrowIfConnectedForConfiguration("AddressStartWithZero");
+                    _addressStartWithZero = value;
+                }
+            }
+        }
+
+        public bool ReferenceAddressStartWithZero
+        {
+            get
+            {
+                lock (_configurationLock)
+                {
+                    return _referenceAddressStartWithZero;
+                }
+            }
+            set
+            {
+                lock (_configurationLock)
+                {
+                    ThrowIfConnectedForConfiguration("ReferenceAddressStartWithZero");
+                    _referenceAddressStartWithZero = value;
+                }
+            }
+        }
+
+        public bool ReverseStringBytes
+        {
+            get
+            {
+                lock (_configurationLock)
+                {
+                    return _reverseStringBytes;
+                }
+            }
+            set
+            {
+                lock (_configurationLock)
+                {
+                    ThrowIfConnectedForConfiguration("ReverseStringBytes");
+                    _reverseStringBytes = value;
+                }
+            }
+        }
+
+        public bool SwapStringBytes
+        {
+            get
+            {
+                lock (_configurationLock)
+                {
+                    return _swapStringBytes;
+                }
+            }
+            set
+            {
+                lock (_configurationLock)
+                {
+                    ThrowIfConnectedForConfiguration("SwapStringBytes");
+                    _swapStringBytes = value;
+                }
+            }
+        }
+
+        public override bool IsConnected
+        {
+            get { return _modbusTcpNet.IsConnected; }
+        }
+
+        public bool IsBusy
+        {
+            get { return _modbusTcpNet.IsBusy; }
+        }
+
+        public ModbusWriteResponse LastWriteResponse
+        {
+            get { return _modbusTcpNet.LastWriteResponse; }
+        }
+
+        public int LockWaitTimeOut
+        {
+            get { return _modbusTcpNet.LockWaitTimeOut; }
+            set { _modbusTcpNet.LockWaitTimeOut = value; }
+        }
 
         public override int ReceiveTimeOut
         {
             get { return base.ReceiveTimeOut; }
             set
             {
-                base.ReceiveTimeOut = value;
-                _modbusTcpNet.ReceiveTimeOut = value;
+                lock (_configurationLock)
+                {
+                    base.ReceiveTimeOut = value;
+                    _modbusTcpNet.ReceiveTimeOut = value;
+                }
             }
         }
 
@@ -33,8 +198,11 @@ namespace XLinkCore.ModbusTcp
             get { return base.ConnectTimeOut; }
             set
             {
-                base.ConnectTimeOut = value;
-                _modbusTcpNet.ConnectTimeOut = value;
+                lock (_configurationLock)
+                {
+                    base.ConnectTimeOut = value;
+                    _modbusTcpNet.ConnectTimeOut = value;
+                }
             }
         }
 
@@ -79,13 +247,14 @@ namespace XLinkCore.ModbusTcp
         {
             try
             {
-                AddressInfo address = ParseAddress(point, typeof(T));
-                object value = ReadValue(typeof(T), address, 1);
+                ConfigurationSnapshot configuration = GetConfigurationSnapshot();
+                AddressInfo address = ParseAddress(point, typeof(T), configuration);
+                object value = ReadValue(typeof(T), address, 1, configuration);
                 return Success((T)value);
             }
             catch (Exception ex)
             {
-                return Error<T>(ex.Message, -1);
+                return Error<T>(ex);
             }
         }
 
@@ -94,13 +263,14 @@ namespace XLinkCore.ModbusTcp
             try
             {
                 Type arrayType = typeof(T[]);
-                AddressInfo address = ParseAddress(point, arrayType);
-                object value = ReadValue(arrayType, address, length);
+                ConfigurationSnapshot configuration = GetConfigurationSnapshot();
+                AddressInfo address = ParseAddress(point, arrayType, configuration);
+                object value = ReadValue(arrayType, address, length, configuration);
                 return Success((T[])value);
             }
             catch (Exception ex)
             {
-                return Error<T[]>(ex.Message, -1);
+                return Error<T[]>(ex);
             }
         }
 
@@ -108,27 +278,14 @@ namespace XLinkCore.ModbusTcp
         {
             try
             {
-                AddressInfo address = ParseAddress(point, typeof(string));
-                object value = ReadValue(typeof(string), address, length);
+                ConfigurationSnapshot configuration = GetConfigurationSnapshot();
+                AddressInfo address = ParseAddress(point, typeof(string), configuration);
+                object value = ReadValue(typeof(string), address, length, configuration);
                 return Success((string)value);
             }
             catch (Exception ex)
             {
-                return Error<string>(ex.Message, -1);
-            }
-        }
-
-        public override Result<string[]> ReadStringArray(string point, ushort length)
-        {
-            try
-            {
-                AddressInfo address = ParseAddress(point, typeof(string[]));
-                object value = ReadValue(typeof(string[]), address, length);
-                return Success((string[])value);
-            }
-            catch (Exception ex)
-            {
-                return Error<string[]>(ex.Message, -1);
+                return Error<string>(ex);
             }
         }
 
@@ -136,13 +293,14 @@ namespace XLinkCore.ModbusTcp
         {
             try
             {
-                AddressInfo address = ParseAddress(point, typeof(T));
-                WriteValue(address, value, typeof(T));
+                ConfigurationSnapshot configuration = GetConfigurationSnapshot();
+                AddressInfo address = ParseAddress(point, typeof(T), configuration);
+                WriteValue(address, value, typeof(T), configuration);
                 return Success();
             }
             catch (Exception ex)
             {
-                return Error(ex.Message, -1);
+                return Error(ex);
             }
         }
 
@@ -205,13 +363,14 @@ namespace XLinkCore.ModbusTcp
         {
             try
             {
-                AddressInfo address = ParseAddress(point, typeof(T));
-                object value = await ReadValueAsync(typeof(T), address, 1).ConfigureAwait(false);
+                ConfigurationSnapshot configuration = GetConfigurationSnapshot();
+                AddressInfo address = ParseAddress(point, typeof(T), configuration);
+                object value = await ReadValueAsync(typeof(T), address, 1, configuration).ConfigureAwait(false);
                 return Success((T)value);
             }
             catch (Exception ex)
             {
-                return Error<T>(ex.Message, -1);
+                return Error<T>(ex);
             }
         }
 
@@ -220,13 +379,14 @@ namespace XLinkCore.ModbusTcp
             try
             {
                 Type arrayType = typeof(T[]);
-                AddressInfo address = ParseAddress(point, arrayType);
-                object value = await ReadValueAsync(arrayType, address, length).ConfigureAwait(false);
+                ConfigurationSnapshot configuration = GetConfigurationSnapshot();
+                AddressInfo address = ParseAddress(point, arrayType, configuration);
+                object value = await ReadValueAsync(arrayType, address, length, configuration).ConfigureAwait(false);
                 return Success((T[])value);
             }
             catch (Exception ex)
             {
-                return Error<T[]>(ex.Message, -1);
+                return Error<T[]>(ex);
             }
         }
 
@@ -234,27 +394,14 @@ namespace XLinkCore.ModbusTcp
         {
             try
             {
-                AddressInfo address = ParseAddress(point, typeof(string));
-                object value = await ReadValueAsync(typeof(string), address, length).ConfigureAwait(false);
+                ConfigurationSnapshot configuration = GetConfigurationSnapshot();
+                AddressInfo address = ParseAddress(point, typeof(string), configuration);
+                object value = await ReadValueAsync(typeof(string), address, length, configuration).ConfigureAwait(false);
                 return Success((string)value);
             }
             catch (Exception ex)
             {
-                return Error<string>(ex.Message, -1);
-            }
-        }
-
-        public override async Task<Result<string[]>> ReadStringArrayAsync(string point, ushort length)
-        {
-            try
-            {
-                AddressInfo address = ParseAddress(point, typeof(string[]));
-                object value = await ReadValueAsync(typeof(string[]), address, length).ConfigureAwait(false);
-                return Success((string[])value);
-            }
-            catch (Exception ex)
-            {
-                return Error<string[]>(ex.Message, -1);
+                return Error<string>(ex);
             }
         }
 
@@ -262,19 +409,63 @@ namespace XLinkCore.ModbusTcp
         {
             try
             {
-                AddressInfo address = ParseAddress(point, typeof(T));
-                await WriteValueAsync(address, value, typeof(T)).ConfigureAwait(false);
+                ConfigurationSnapshot configuration = GetConfigurationSnapshot();
+                AddressInfo address = ParseAddress(point, typeof(T), configuration);
+                await WriteValueAsync(address, value, typeof(T), configuration).ConfigureAwait(false);
                 return Success();
             }
             catch (Exception ex)
             {
-                return Error(ex.Message, -1);
+                return Error(ex);
             }
         }
 
         public override void Dispose()
         {
+            if (Interlocked.Exchange(ref _disposed, 1) == 1)
+            {
+                return;
+            }
+
             _modbusTcpNet.Dispose();
+        }
+
+        internal byte[] OriginalBytes(byte[] bytes)
+        {
+            return _modbusTcpNet.OriginalBytes(bytes);
+        }
+
+        public ModbusTcpStatistics GetStatistics()
+        {
+            return _modbusTcpNet.GetStatistics();
+        }
+
+        public void ResetStatistics()
+        {
+            _modbusTcpNet.ResetStatistics();
+        }
+
+        private ConfigurationSnapshot GetConfigurationSnapshot()
+        {
+            lock (_configurationLock)
+            {
+                return new ConfigurationSnapshot(
+                    _dataFormat,
+                    _station,
+                    _stringEncoding,
+                    _addressStartWithZero,
+                    _referenceAddressStartWithZero,
+                    _reverseStringBytes,
+                    _swapStringBytes);
+            }
+        }
+
+        private void ThrowIfConnectedForConfiguration(string propertyName)
+        {
+            if (_modbusTcpNet.IsConnected)
+            {
+                throw new InvalidOperationException(propertyName + " cannot be changed while connected.");
+            }
         }
 
         private Result WriteArray<T>(string point, T[] value)
@@ -282,7 +473,7 @@ namespace XLinkCore.ModbusTcp
             return Write<T[]>(point, value);
         }
 
-        private object ReadValue(Type targetType, AddressInfo address, ushort length)
+        private object ReadValue(Type targetType, AddressInfo address, ushort length, ConfigurationSnapshot configuration)
         {
             Type elementType = GetElementType(targetType);
             bool isArray = targetType.IsArray;
@@ -290,7 +481,7 @@ namespace XLinkCore.ModbusTcp
             if (elementType == typeof(bool))
             {
                 int count = isArray ? length : 1;
-                byte[] bitBytes = ReadBits(address, checked((ushort)count));
+                byte[] bitBytes = ReadBits(address, checked((ushort)count), configuration);
                 bool[] values = BitsToBooleans(bitBytes, count);
                 return isArray ? (object)values : values[0];
             }
@@ -298,53 +489,42 @@ namespace XLinkCore.ModbusTcp
             if (elementType == typeof(string))
             {
                 ushort registerCount = length == 0 ? (ushort)1 : length;
-                byte[] bytes = ReadRegisterBytes(address, registerCount);
+                byte[] bytes = ReadRegisterBytes(address, registerCount, configuration);
                 if (isArray)
                 {
                     string[] values = new string[registerCount];
                     for (int i = 0; i < registerCount; i++)
                     {
-                        byte[] itemBytes = new byte[2];
-                        Buffer.BlockCopy(bytes, i * 2, itemBytes, 0, 2);
-                        values[i] = DecodeString(itemBytes);
+                        values[i] = DecodeString(bytes, i * 2, 2, configuration);
                     }
 
                     return values;
                 }
 
-                return DecodeString(bytes);
+                return DecodeString(bytes, configuration);
             }
 
             int elementSize = SizeOf(elementType);
             int elementCount = isArray ? length : 1;
             int byteCount = checked(elementSize * elementCount);
             ushort registers = checked((ushort)((byteCount + 1) / 2));
-            byte[] registerBytes = ReadRegisterBytes(address, registers);
-
-            if (registerBytes.Length != byteCount)
-            {
-                byte[] trimmed = new byte[byteCount];
-                Buffer.BlockCopy(registerBytes, 0, trimmed, 0, byteCount);
-                registerBytes = trimmed;
-            }
+            byte[] registerBytes = ReadRegisterBytes(address, registers, configuration);
 
             if (isArray)
             {
                 Array array = Array.CreateInstance(elementType, elementCount);
                 for (int i = 0; i < elementCount; i++)
                 {
-                    byte[] itemBytes = new byte[elementSize];
-                    Buffer.BlockCopy(registerBytes, i * elementSize, itemBytes, 0, elementSize);
-                    array.SetValue(BytesToValue(itemBytes, elementType), i);
+                    array.SetValue(BytesToValue(registerBytes, i * elementSize, elementSize, elementType, configuration), i);
                 }
 
                 return array;
             }
 
-            return BytesToValue(registerBytes, elementType);
+            return BytesToValue(registerBytes, 0, elementSize, elementType, configuration);
         }
 
-        private async Task<object> ReadValueAsync(Type targetType, AddressInfo address, ushort length)
+        private async Task<object> ReadValueAsync(Type targetType, AddressInfo address, ushort length, ConfigurationSnapshot configuration)
         {
             Type elementType = GetElementType(targetType);
             bool isArray = targetType.IsArray;
@@ -352,7 +532,7 @@ namespace XLinkCore.ModbusTcp
             if (elementType == typeof(bool))
             {
                 int count = isArray ? length : 1;
-                byte[] bitBytes = await ReadBitsAsync(address, checked((ushort)count)).ConfigureAwait(false);
+                byte[] bitBytes = await ReadBitsAsync(address, checked((ushort)count), configuration).ConfigureAwait(false);
                 bool[] values = BitsToBooleans(bitBytes, count);
                 return isArray ? (object)values : values[0];
             }
@@ -360,53 +540,42 @@ namespace XLinkCore.ModbusTcp
             if (elementType == typeof(string))
             {
                 ushort registerCount = length == 0 ? (ushort)1 : length;
-                byte[] bytes = await ReadRegisterBytesAsync(address, registerCount).ConfigureAwait(false);
+                byte[] bytes = await ReadRegisterBytesAsync(address, registerCount, configuration).ConfigureAwait(false);
                 if (isArray)
                 {
                     string[] values = new string[registerCount];
                     for (int i = 0; i < registerCount; i++)
                     {
-                        byte[] itemBytes = new byte[2];
-                        Buffer.BlockCopy(bytes, i * 2, itemBytes, 0, 2);
-                        values[i] = DecodeString(itemBytes);
+                        values[i] = DecodeString(bytes, i * 2, 2, configuration);
                     }
 
                     return values;
                 }
 
-                return DecodeString(bytes);
+                return DecodeString(bytes, configuration);
             }
 
             int elementSize = SizeOf(elementType);
             int elementCount = isArray ? length : 1;
             int byteCount = checked(elementSize * elementCount);
             ushort registers = checked((ushort)((byteCount + 1) / 2));
-            byte[] registerBytes = await ReadRegisterBytesAsync(address, registers).ConfigureAwait(false);
-
-            if (registerBytes.Length != byteCount)
-            {
-                byte[] trimmed = new byte[byteCount];
-                Buffer.BlockCopy(registerBytes, 0, trimmed, 0, byteCount);
-                registerBytes = trimmed;
-            }
+            byte[] registerBytes = await ReadRegisterBytesAsync(address, registers, configuration).ConfigureAwait(false);
 
             if (isArray)
             {
                 Array array = Array.CreateInstance(elementType, elementCount);
                 for (int i = 0; i < elementCount; i++)
                 {
-                    byte[] itemBytes = new byte[elementSize];
-                    Buffer.BlockCopy(registerBytes, i * elementSize, itemBytes, 0, elementSize);
-                    array.SetValue(BytesToValue(itemBytes, elementType), i);
+                    array.SetValue(BytesToValue(registerBytes, i * elementSize, elementSize, elementType, configuration), i);
                 }
 
                 return array;
             }
 
-            return BytesToValue(registerBytes, elementType);
+            return BytesToValue(registerBytes, 0, elementSize, elementType, configuration);
         }
 
-        private void WriteValue<T>(AddressInfo address, T value, Type targetType)
+        private void WriteValue<T>(AddressInfo address, T value, Type targetType, ConfigurationSnapshot configuration)
         {
             if (value == null)
             {
@@ -425,11 +594,11 @@ namespace XLinkCore.ModbusTcp
                 if (targetType.IsArray)
                 {
                     bool[] values = (bool[])(object)value;
-                    _modbusTcpNet.WriteMultipleCoils(GetStation(), address.Address, values);
+                    _modbusTcpNet.WriteMultipleCoils(GetStation(configuration), address.Address, values);
                 }
                 else
                 {
-                    _modbusTcpNet.WriteSingleCoil(GetStation(), address.Address, (bool)(object)value);
+                    _modbusTcpNet.WriteSingleCoil(GetStation(configuration), address.Address, (bool)(object)value);
                 }
 
                 return;
@@ -442,11 +611,11 @@ namespace XLinkCore.ModbusTcp
                 {
                     string[] values = (string[])(object)value;
                     string text = string.Concat(values);
-                    bytes = EncodeString(text);
+                    bytes = EncodeString(text, configuration);
                 }
                 else
                 {
-                    bytes = EncodeString((string)(object)value);
+                    bytes = EncodeString((string)(object)value, configuration);
                 }
             }
             else if (targetType.IsArray)
@@ -456,13 +625,12 @@ namespace XLinkCore.ModbusTcp
                 bytes = new byte[array.Length * elementSize];
                 for (int i = 0; i < array.Length; i++)
                 {
-                    byte[] itemBytes = ValueToBytes(array.GetValue(i), elementType);
-                    Buffer.BlockCopy(itemBytes, 0, bytes, i * elementSize, elementSize);
+                    WriteValueBytes(array.GetValue(i), elementType, configuration, bytes, i * elementSize);
                 }
             }
             else
             {
-                bytes = ValueToBytes(value, elementType);
+                bytes = ValueToBytes(value, elementType, configuration);
             }
 
             if (bytes.Length % 2 != 0)
@@ -479,15 +647,15 @@ namespace XLinkCore.ModbusTcp
 
             if (bytes.Length == 2)
             {
-                _modbusTcpNet.WriteSingleRegister(GetStation(), address.Address, bytes);
+                _modbusTcpNet.WriteSingleRegister(GetStation(configuration), address.Address, bytes);
             }
             else
             {
-                _modbusTcpNet.WriteMultipleRegisters(GetStation(), address.Address, bytes);
+                _modbusTcpNet.WriteMultipleRegisters(GetStation(configuration), address.Address, bytes);
             }
         }
 
-        private async Task WriteValueAsync<T>(AddressInfo address, T value, Type targetType)
+        private async Task WriteValueAsync<T>(AddressInfo address, T value, Type targetType, ConfigurationSnapshot configuration)
         {
             if (value == null)
             {
@@ -506,11 +674,11 @@ namespace XLinkCore.ModbusTcp
                 if (targetType.IsArray)
                 {
                     bool[] values = (bool[])(object)value;
-                    await _modbusTcpNet.WriteMultipleCoilsAsync(GetStation(), address.Address, values).ConfigureAwait(false);
+                    await _modbusTcpNet.WriteMultipleCoilsAsync(GetStation(configuration), address.Address, values).ConfigureAwait(false);
                 }
                 else
                 {
-                    await _modbusTcpNet.WriteSingleCoilAsync(GetStation(), address.Address, (bool)(object)value).ConfigureAwait(false);
+                    await _modbusTcpNet.WriteSingleCoilAsync(GetStation(configuration), address.Address, (bool)(object)value).ConfigureAwait(false);
                 }
 
                 return;
@@ -523,11 +691,11 @@ namespace XLinkCore.ModbusTcp
                 {
                     string[] values = (string[])(object)value;
                     string text = string.Concat(values);
-                    bytes = EncodeString(text);
+                bytes = EncodeString(text, configuration);
                 }
                 else
                 {
-                    bytes = EncodeString((string)(object)value);
+                    bytes = EncodeString((string)(object)value, configuration);
                 }
             }
             else if (targetType.IsArray)
@@ -537,13 +705,12 @@ namespace XLinkCore.ModbusTcp
                 bytes = new byte[array.Length * elementSize];
                 for (int i = 0; i < array.Length; i++)
                 {
-                    byte[] itemBytes = ValueToBytes(array.GetValue(i), elementType);
-                    Buffer.BlockCopy(itemBytes, 0, bytes, i * elementSize, elementSize);
+                    WriteValueBytes(array.GetValue(i), elementType, configuration, bytes, i * elementSize);
                 }
             }
             else
             {
-                bytes = ValueToBytes(value, elementType);
+                bytes = ValueToBytes(value, elementType, configuration);
             }
 
             if (bytes.Length % 2 != 0)
@@ -560,98 +727,120 @@ namespace XLinkCore.ModbusTcp
 
             if (bytes.Length == 2)
             {
-                await _modbusTcpNet.WriteSingleRegisterAsync(GetStation(), address.Address, bytes).ConfigureAwait(false);
+                await _modbusTcpNet.WriteSingleRegisterAsync(GetStation(configuration), address.Address, bytes).ConfigureAwait(false);
             }
             else
             {
-                await _modbusTcpNet.WriteMultipleRegistersAsync(GetStation(), address.Address, bytes).ConfigureAwait(false);
+                await _modbusTcpNet.WriteMultipleRegistersAsync(GetStation(configuration), address.Address, bytes).ConfigureAwait(false);
             }
         }
 
-        private byte[] ReadBits(AddressInfo address, ushort count)
+        private byte[] ReadBits(AddressInfo address, ushort count, ConfigurationSnapshot configuration)
         {
             switch (address.Area)
             {
                 case RegisterArea.DiscreteInput:
-                    return _modbusTcpNet.ReadDiscreteInputs(GetStation(), address.Address, count);
+                    return _modbusTcpNet.ReadDiscreteInputs(GetStation(configuration), address.Address, count);
                 case RegisterArea.Coil:
-                    return _modbusTcpNet.ReadCoils(GetStation(), address.Address, count);
+                    return _modbusTcpNet.ReadCoils(GetStation(configuration), address.Address, count);
                 default:
                     throw new NotSupportedException("Boolean reads only support coil or discrete input addresses.");
             }
         }
 
-        private Task<byte[]> ReadBitsAsync(AddressInfo address, ushort count)
+        private Task<byte[]> ReadBitsAsync(AddressInfo address, ushort count, ConfigurationSnapshot configuration)
         {
             switch (address.Area)
             {
                 case RegisterArea.DiscreteInput:
-                    return _modbusTcpNet.ReadDiscreteInputsAsync(GetStation(), address.Address, count);
+                    return _modbusTcpNet.ReadDiscreteInputsAsync(GetStation(configuration), address.Address, count);
                 case RegisterArea.Coil:
-                    return _modbusTcpNet.ReadCoilsAsync(GetStation(), address.Address, count);
+                    return _modbusTcpNet.ReadCoilsAsync(GetStation(configuration), address.Address, count);
                 default:
                     throw new NotSupportedException("Boolean reads only support coil or discrete input addresses.");
             }
         }
 
-        private byte[] ReadRegisterBytes(AddressInfo address, ushort registers)
+        private byte[] ReadRegisterBytes(AddressInfo address, ushort registers, ConfigurationSnapshot configuration)
         {
             switch (address.Area)
             {
                 case RegisterArea.InputRegister:
-                    return _modbusTcpNet.ReadInputRegisters(GetStation(), address.Address, registers);
+                    return _modbusTcpNet.ReadInputRegisters(GetStation(configuration), address.Address, registers);
                 case RegisterArea.HoldingRegister:
-                    return _modbusTcpNet.ReadHoldingRegisters(GetStation(), address.Address, registers);
+                    return _modbusTcpNet.ReadHoldingRegisters(GetStation(configuration), address.Address, registers);
                 default:
                     throw new NotSupportedException("Register reads only support holding register or input register addresses.");
             }
         }
 
-        private Task<byte[]> ReadRegisterBytesAsync(AddressInfo address, ushort registers)
+        private Task<byte[]> ReadRegisterBytesAsync(AddressInfo address, ushort registers, ConfigurationSnapshot configuration)
         {
             switch (address.Area)
             {
                 case RegisterArea.InputRegister:
-                    return _modbusTcpNet.ReadInputRegistersAsync(GetStation(), address.Address, registers);
+                    return _modbusTcpNet.ReadInputRegistersAsync(GetStation(configuration), address.Address, registers);
                 case RegisterArea.HoldingRegister:
-                    return _modbusTcpNet.ReadHoldingRegistersAsync(GetStation(), address.Address, registers);
+                    return _modbusTcpNet.ReadHoldingRegistersAsync(GetStation(configuration), address.Address, registers);
                 default:
                     throw new NotSupportedException("Register reads only support holding register or input register addresses.");
             }
         }
 
-        private string DecodeString(byte[] bytes)
+        private string DecodeString(byte[] bytes, ConfigurationSnapshot configuration)
         {
-            byte[] stringBytes = ApplyStringFormat(bytes);
-            return StringEncoding.GetString(stringBytes).TrimEnd('\0');
+            return DecodeString(bytes, 0, bytes.Length, configuration);
         }
 
-        private byte[] EncodeString(string value)
+        private string DecodeString(byte[] bytes, int offset, int count, ConfigurationSnapshot configuration)
         {
-            byte[] bytes = StringEncoding.GetBytes(value);
+            byte[] stringBytes = ApplyStringFormat(bytes, offset, count, configuration);
+            try
+            {
+                return configuration.StringEncoding.GetString(stringBytes, 0, count).TrimEnd('\0');
+            }
+            finally
+            {
+                ReturnArray(stringBytes);
+            }
+        }
+
+        private byte[] EncodeString(string value, ConfigurationSnapshot configuration)
+        {
+            byte[] bytes = configuration.StringEncoding.GetBytes(value);
+            int byteCount = bytes.Length;
             if (bytes.Length % 2 != 0)
             {
                 byte[] padded = new byte[bytes.Length + 1];
                 Buffer.BlockCopy(bytes, 0, padded, 0, bytes.Length);
                 bytes = padded;
+                byteCount = bytes.Length;
             }
 
-            return ApplyStringFormat(bytes);
+            byte[] formatted = ApplyStringFormat(bytes, 0, byteCount, configuration);
+            try
+            {
+                return CopyExact(formatted, 0, byteCount);
+            }
+            finally
+            {
+                ReturnArray(formatted);
+            }
         }
 
-        private byte[] ApplyStringFormat(byte[] bytes)
+        private byte[] ApplyStringFormat(byte[] bytes, int offset, int count, ConfigurationSnapshot configuration)
         {
-            byte[] result = new byte[bytes.Length];
-            Buffer.BlockCopy(bytes, 0, result, 0, bytes.Length);
+            byte[] result = RentArray(count);
+            Buffer.BlockCopy(bytes, offset, result, 0, count);
 
-            if (SwapStringBytes)
+            if (configuration.SwapStringBytes)
             {
-                SwapEveryTwoBytes(result);
+                SwapEveryTwoBytes(result, count);
             }
 
-            if (ReverseStringBytes)
+            if (configuration.ReverseStringBytes)
             {
-                Array.Reverse(result);
+                Array.Reverse(result, 0, count);
             }
 
             return result;
@@ -659,6 +848,12 @@ namespace XLinkCore.ModbusTcp
 
         private static bool[] BitsToBooleans(byte[] bytes, int count)
         {
+            int requiredBytes = (count + 7) / 8;
+            if (bytes == null || bytes.Length < requiredBytes)
+            {
+                throw new ModbusTcpProtocolException("Modbus bit response data is shorter than requested count.");
+            }
+
             bool[] values = new bool[count];
             for (int i = 0; i < count; i++)
             {
@@ -668,59 +863,78 @@ namespace XLinkCore.ModbusTcp
             return values;
         }
 
-        private object BytesToValue(byte[] bytes, Type type)
+        private object BytesToValue(byte[] bytes, int offset, int count, Type type, ConfigurationSnapshot configuration)
         {
-            byte[] valueBytes = ApplyDataFormat(bytes);
-
-            if (type == typeof(byte))
+            byte[] valueBytes = ApplyDataFormat(bytes, offset, count, configuration.DataFormat);
+            try
             {
-                return valueBytes[0];
-            }
+                if (type == typeof(byte))
+                {
+                    return valueBytes[0];
+                }
 
-            if (type == typeof(short))
+                if (type == typeof(short))
+                {
+                    return BitConverter.ToInt16(valueBytes, 0);
+                }
+
+                if (type == typeof(ushort))
+                {
+                    return BitConverter.ToUInt16(valueBytes, 0);
+                }
+
+                if (type == typeof(int))
+                {
+                    return BitConverter.ToInt32(valueBytes, 0);
+                }
+
+                if (type == typeof(uint))
+                {
+                    return BitConverter.ToUInt32(valueBytes, 0);
+                }
+
+                if (type == typeof(long))
+                {
+                    return BitConverter.ToInt64(valueBytes, 0);
+                }
+
+                if (type == typeof(ulong))
+                {
+                    return BitConverter.ToUInt64(valueBytes, 0);
+                }
+
+                if (type == typeof(float))
+                {
+                    return BitConverter.ToSingle(valueBytes, 0);
+                }
+
+                if (type == typeof(double))
+                {
+                    return BitConverter.ToDouble(valueBytes, 0);
+                }
+
+                throw new NotSupportedException("Unsupported read type: " + type.FullName);
+            }
+            finally
             {
-                return BitConverter.ToInt16(valueBytes, 0);
+                ReturnArray(valueBytes);
             }
-
-            if (type == typeof(ushort))
-            {
-                return BitConverter.ToUInt16(valueBytes, 0);
-            }
-
-            if (type == typeof(int))
-            {
-                return BitConverter.ToInt32(valueBytes, 0);
-            }
-
-            if (type == typeof(uint))
-            {
-                return BitConverter.ToUInt32(valueBytes, 0);
-            }
-
-            if (type == typeof(long))
-            {
-                return BitConverter.ToInt64(valueBytes, 0);
-            }
-
-            if (type == typeof(ulong))
-            {
-                return BitConverter.ToUInt64(valueBytes, 0);
-            }
-
-            if (type == typeof(float))
-            {
-                return BitConverter.ToSingle(valueBytes, 0);
-            }
-
-            if (type == typeof(double))
-            {
-                return BitConverter.ToDouble(valueBytes, 0);
-            }
-
-            throw new NotSupportedException("Unsupported read type: " + type.FullName);
         }
 
-        private byte[] ValueToBytes(object value, Type type)
+        private byte[] ValueToBytes(object value, Type type, ConfigurationSnapshot configuration)
+        {
+            byte[] rented = RentValueBytes(value, type, configuration);
+            try
+            {
+                return CopyExact(rented, 0, SizeOf(type));
+            }
+            finally
+            {
+                ReturnArray(rented);
+            }
+        }
+
+        private byte[] RentValueBytes(object value, Type type, ConfigurationSnapshot configuration)
         {
             byte[] bytes;
 
@@ -765,44 +979,57 @@ namespace XLinkCore.ModbusTcp
                 throw new NotSupportedException("Unsupported write type: " + type.FullName);
             }
 
-            return ApplyDataFormat(bytes);
+            return ApplyDataFormat(bytes, 0, bytes.Length, configuration.DataFormat);
         }
 
-        private byte[] ApplyDataFormat(byte[] bytes)
+        private void WriteValueBytes(object value, Type type, ConfigurationSnapshot configuration, byte[] target, int targetOffset)
         {
-            byte[] result = new byte[bytes.Length];
-            Buffer.BlockCopy(bytes, 0, result, 0, bytes.Length);
+            byte[] valueBytes = RentValueBytes(value, type, configuration);
+            try
+            {
+                Buffer.BlockCopy(valueBytes, 0, target, targetOffset, SizeOf(type));
+            }
+            finally
+            {
+                ReturnArray(valueBytes);
+            }
+        }
+
+        private byte[] ApplyDataFormat(byte[] bytes, int offset, int count, DataFormat dataFormat)
+        {
+            byte[] result = RentArray(count);
+            Buffer.BlockCopy(bytes, offset, result, 0, count);
 
             if (BitConverter.IsLittleEndian)
             {
-                Array.Reverse(result);
+                Array.Reverse(result, 0, count);
             }
 
-            if (result.Length <= 2)
+            if (count <= 2)
             {
-                if (DataFormat == DataFormat.BADC || DataFormat == DataFormat.DCBA)
+                if (dataFormat == DataFormat.BADC || dataFormat == DataFormat.DCBA)
                 {
-                    SwapEveryTwoBytes(result);
+                    SwapEveryTwoBytes(result, count);
                 }
 
                 return result;
             }
 
-            switch (DataFormat)
+            switch (dataFormat)
             {
                 case DataFormat.ABCD:
                     break;
                 case DataFormat.BADC:
-                    SwapEveryTwoBytes(result);
+                    SwapEveryTwoBytes(result, count);
                     break;
                 case DataFormat.CDAB:
-                    SwapWords(result);
+                    SwapWords(result, count);
                     break;
                 case DataFormat.DCBA:
-                    Array.Reverse(result);
+                    Array.Reverse(result, 0, count);
                     break;
                 default:
-                    throw new NotSupportedException("Unsupported data format: " + DataFormat);
+                    throw new NotSupportedException("Unsupported data format: " + dataFormat);
             }
 
             return result;
@@ -810,7 +1037,12 @@ namespace XLinkCore.ModbusTcp
 
         private static void SwapEveryTwoBytes(byte[] bytes)
         {
-            for (int i = 0; i + 1 < bytes.Length; i += 2)
+            SwapEveryTwoBytes(bytes, bytes.Length);
+        }
+
+        private static void SwapEveryTwoBytes(byte[] bytes, int count)
+        {
+            for (int i = 0; i + 1 < count; i += 2)
             {
                 byte temp = bytes[i];
                 bytes[i] = bytes[i + 1];
@@ -820,21 +1052,50 @@ namespace XLinkCore.ModbusTcp
 
         private static void SwapWords(byte[] bytes)
         {
-            if (bytes.Length % 2 != 0)
+            SwapWords(bytes, bytes.Length);
+        }
+
+        private static void SwapWords(byte[] bytes, int count)
+        {
+            if (count % 2 != 0)
             {
                 return;
             }
 
-            byte[] copy = new byte[bytes.Length];
-            Buffer.BlockCopy(bytes, 0, copy, 0, bytes.Length);
-            int wordCount = bytes.Length / 2;
-            for (int i = 0; i < wordCount; i++)
+            byte[] copy = RentArray(count);
+            Buffer.BlockCopy(bytes, 0, copy, 0, count);
+            try
             {
-                int source = i * 2;
-                int target = ((i + wordCount / 2) % wordCount) * 2;
-                bytes[target] = copy[source];
-                bytes[target + 1] = copy[source + 1];
+                int wordCount = count / 2;
+                for (int i = 0; i < wordCount; i++)
+                {
+                    int source = i * 2;
+                    int target = ((i + wordCount / 2) % wordCount) * 2;
+                    bytes[target] = copy[source];
+                    bytes[target + 1] = copy[source + 1];
+                }
             }
+            finally
+            {
+                ReturnArray(copy);
+            }
+        }
+
+        private static byte[] RentArray(int minimumLength)
+        {
+            return ArrayPool<byte>.Shared.Rent(minimumLength);
+        }
+
+        private static byte[] CopyExact(byte[] source, int offset, int count)
+        {
+            byte[] target = new byte[count];
+            Buffer.BlockCopy(source, offset, target, 0, count);
+            return target;
+        }
+
+        private static void ReturnArray(byte[] bytes)
+        {
+            ArrayPool<byte>.Shared.Return(bytes);
         }
 
         private static Type GetElementType(Type type)
@@ -867,7 +1128,7 @@ namespace XLinkCore.ModbusTcp
             throw new NotSupportedException("Unsupported type: " + type.FullName);
         }
 
-        private AddressInfo ParseAddress(string point, Type targetType)
+        private AddressInfo ParseAddress(string point, Type targetType, ConfigurationSnapshot configuration)
         {
             if (string.IsNullOrWhiteSpace(point))
             {
@@ -879,7 +1140,7 @@ namespace XLinkCore.ModbusTcp
             if (separatorIndex >= 0)
             {
                 string prefix = text.Substring(0, separatorIndex).Trim().ToLowerInvariant();
-                ushort address = NormalizeAddress(ParseUInt16Address(text.Substring(separatorIndex + 1)));
+                ushort address = NormalizeAddress(ParseUInt16Address(text.Substring(separatorIndex + 1)), configuration);
                 return new AddressInfo(ParseArea(prefix, targetType), address);
             }
 
@@ -888,17 +1149,17 @@ namespace XLinkCore.ModbusTcp
             {
                 if (reference >= 40001 && reference <= 49999)
                 {
-                    return new AddressInfo(RegisterArea.HoldingRegister, ParseReferenceAddress(reference, 40000));
+                    return new AddressInfo(RegisterArea.HoldingRegister, ParseReferenceAddress(reference, 40000, configuration));
                 }
 
                 if (reference >= 30001 && reference <= 39999)
                 {
-                    return new AddressInfo(RegisterArea.InputRegister, ParseReferenceAddress(reference, 30000));
+                    return new AddressInfo(RegisterArea.InputRegister, ParseReferenceAddress(reference, 30000, configuration));
                 }
 
                 if (reference >= 10001 && reference <= 19999)
                 {
-                    return new AddressInfo(RegisterArea.DiscreteInput, ParseReferenceAddress(reference, 10000));
+                    return new AddressInfo(RegisterArea.DiscreteInput, ParseReferenceAddress(reference, 10000, configuration));
                 }
 
                 if (reference >= 1 && reference <= 9999)
@@ -907,7 +1168,7 @@ namespace XLinkCore.ModbusTcp
                     RegisterArea area = elementType == typeof(bool)
                         ? RegisterArea.Coil
                         : RegisterArea.HoldingRegister;
-                    return new AddressInfo(area, NormalizeAddress(checked((ushort)reference)));
+                    return new AddressInfo(area, NormalizeAddress(checked((ushort)reference), configuration));
                 }
 
                 if (reference >= 0 && reference <= ushort.MaxValue)
@@ -916,7 +1177,7 @@ namespace XLinkCore.ModbusTcp
                     RegisterArea area = elementType == typeof(bool)
                         ? RegisterArea.Coil
                         : RegisterArea.HoldingRegister;
-                    return new AddressInfo(area, NormalizeAddress((ushort)reference));
+                    return new AddressInfo(area, NormalizeAddress((ushort)reference, configuration));
                 }
             }
 
@@ -934,9 +1195,9 @@ namespace XLinkCore.ModbusTcp
             return address;
         }
 
-        private ushort NormalizeAddress(ushort address)
+        private ushort NormalizeAddress(ushort address, ConfigurationSnapshot configuration)
         {
-            if (AddressStartWithZero || address == 0)
+            if (configuration.AddressStartWithZero || address == 0)
             {
                 return address;
             }
@@ -944,10 +1205,10 @@ namespace XLinkCore.ModbusTcp
             return checked((ushort)(address - 1));
         }
 
-        private ushort ParseReferenceAddress(int reference, int baseAddress)
+        private ushort ParseReferenceAddress(int reference, int baseAddress, ConfigurationSnapshot configuration)
         {
             int address = reference - baseAddress;
-            if (ReferenceAddressStartWithZero)
+            if (configuration.ReferenceAddressStartWithZero)
             {
                 address--;
             }
@@ -1002,12 +1263,18 @@ namespace XLinkCore.ModbusTcp
 
         private byte GetStation()
         {
-            if (Station < byte.MinValue || Station > byte.MaxValue)
+            return GetStation(GetConfigurationSnapshot());
+        }
+
+        private static byte GetStation(ConfigurationSnapshot configuration)
+        {
+            int station = configuration.Station;
+            if (station < byte.MinValue || station > byte.MaxValue)
             {
                 throw new InvalidOperationException("Station must be between 0 and 255.");
             }
 
-            return (byte)Station;
+            return (byte)station;
         }
 
         private static Result Success()
@@ -1038,6 +1305,11 @@ namespace XLinkCore.ModbusTcp
             };
         }
 
+        private static Result Error(Exception exception)
+        {
+            return Error(exception.Message, ModbusTcpErrorCodes.FromException(exception));
+        }
+
         private static Result<T> Error<T>(string message, int errorCode)
         {
             return new Result<T>
@@ -1048,12 +1320,46 @@ namespace XLinkCore.ModbusTcp
             };
         }
 
+        private static Result<T> Error<T>(Exception exception)
+        {
+            return Error<T>(exception.Message, ModbusTcpErrorCodes.FromException(exception));
+        }
+
         private enum RegisterArea
         {
             Coil,
             DiscreteInput,
             HoldingRegister,
             InputRegister
+        }
+
+        private struct ConfigurationSnapshot
+        {
+            public ConfigurationSnapshot(
+                DataFormat dataFormat,
+                int station,
+                Encoding stringEncoding,
+                bool addressStartWithZero,
+                bool referenceAddressStartWithZero,
+                bool reverseStringBytes,
+                bool swapStringBytes)
+            {
+                DataFormat = dataFormat;
+                Station = station;
+                StringEncoding = stringEncoding;
+                AddressStartWithZero = addressStartWithZero;
+                ReferenceAddressStartWithZero = referenceAddressStartWithZero;
+                ReverseStringBytes = reverseStringBytes;
+                SwapStringBytes = swapStringBytes;
+            }
+
+            public DataFormat DataFormat { get; }
+            public int Station { get; }
+            public Encoding StringEncoding { get; }
+            public bool AddressStartWithZero { get; }
+            public bool ReferenceAddressStartWithZero { get; }
+            public bool ReverseStringBytes { get; }
+            public bool SwapStringBytes { get; }
         }
 
         private struct AddressInfo
