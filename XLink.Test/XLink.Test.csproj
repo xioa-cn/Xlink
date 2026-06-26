@@ -20,6 +20,7 @@
 
     <ItemGroup>
       <ProjectReference Include="..\XLinkCore.ModbusTcp\XLinkCore.ModbusTcp.csproj" />
+      <ProjectReference Include="..\XLinkCore.SiemensS7\XLinkCore.SiemensS7.csproj" />
     </ItemGroup>
 
 </Project>
