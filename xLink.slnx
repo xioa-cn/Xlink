@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="XLink.Test/XLink.Test.csproj" />
+  <Project Path="XLinkCore.ModbusTcp/XLinkCore.ModbusTcp.csproj" />
+  <Project Path="XLinkCore/XLinkCore.csproj" />
+</Solution>
